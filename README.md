@@ -1,21 +1,15 @@
-# Dynamic Models Extension
+# Router Model Extension
 
-A dynamic model loader for the `llama-cpp` provider that automatically discovers and registers available models at startup from a remote model definition endpoint.
+A model loader for the `llama.cpp` router mode, that automatically discovers and registers available models at startup from a remote model definition endpoint.
 
 ## Overview
 
-This extension replaces the static `models` array in the `llama-cpp` provider with a dynamically fetched list of models. It works in two phases:
+This extension replaces the static `models` array in the `models.json` configuration with a dynamically fetched list of models it `modelDefinitionUrl` is set. 
+
+It works in two phases:
 
 1. **Startup** — Fetches a model definition JSON from a configurable URL (`modelDefinitionUrl`) and injects the discovered models into the provider registry.
-2. **First use** — On the first request for each model, it queries the llama.cpp server's `/props` endpoint to discover the actual context window (`n_ctx`) for that model, then updates the provider registry so the UI reflects the correct value.
-
-## How it works
-
-- Reads provider configuration from `models.json`.
-- Fetches model metadata from the URL specified in `providerConfig.modelDefinitionUrl`.
-- Transforms the raw model list into Pi's model format with sensible defaults (reasoning enabled, free cost, default 65536 context window).
-- Registers the models with Pi's provider system.
-- On first request, fetches the model's properties from the llama.cpp server to determine its real context window, caching the result and updating the provider registry.
+2. **First use** — On the first request for each model, it queries the llama.cpp server's `/props` endpoint to discover the actual context window (`n_ctx`) for that model, then updates the provider registry so the UI reflects the correct value. If the model is not loaded, it loads the model automatically.
 
 ## Configuration
 
@@ -26,14 +20,14 @@ Add the extension path to `settings.json` under the `extensions` array:
 ```json
 {
   "extensions": [
-    "~/.pi/agent/extensions/dynamic-models"
+    "~/.pi/agent/extensions/router-model-extension"
   ]
 }
 ```
 
-### 2. Configure the `llama-cpp` provider
+### 2. Configure the `models.json` config
 
-Add a `modelDefinitionUrl` field to the `llama-cpp` provider in `models.json`:
+Add a `modelDefinitionUrl` field to the `llama-cpp` or whatever you named your provider in `models.json`:
 
 ```json
 {
@@ -62,7 +56,7 @@ Add a `modelDefinitionUrl` field to the `llama-cpp` provider in `models.json`:
 | `api`                | API compatibility mode (optional, e.g. `"openai"`)                 | `models.json` |
 | `compat`             | Compatibility setting passed through to the provider (optional)    | `models.json` |
 
-Only the `modelDefinitionUrl` is specific to this extension — all other fields are standard `llama-cpp` provider config in `models.json`. The extension itself is registered in `settings.json`.
+Only the `modelDefinitionUrl` is specific to this extension — all other fields are just forwarded.
 
 ## Model format
 

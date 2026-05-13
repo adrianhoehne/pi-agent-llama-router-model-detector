@@ -120,7 +120,9 @@ function transformModels(rawModels) {
     id: m.id,
     name: formatModelName(m.id),
     reasoning: true,
-    input: ["text"],
+    input: (m.architecture?.input_modalities ?? ["text"]).filter(
+      (modality) => modality === "text" || modality === "image"
+    ),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
   }));

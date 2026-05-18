@@ -1,16 +1,16 @@
 /**
- * Dynamic Model Loader for llama-cpp provider
+ * Dynamic Model Loader for llama-cpp router providers
  *
  * Reads modelDefinitionUrl from models.json provider config.
  * Fetches available models at startup, injects them into the provider.
  * Discovers context windows via before_provider_request hook on first use.
  *
- * All other provider config (baseUrl, api, apiKey, compat) comes from
- * models.json — only the models array is replaced dynamically.
+ * All other provider config comes from models.json — only the models array
+ * is replaced dynamically.
  */
 
 import { readFileSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,14 +18,15 @@ const MODELS_PATH = resolve(__dirname, "../../models.json");
 
 const DEFAULT_CONTEXT_WINDOW = 65536;
 const PROPS_TIMEOUT_MS = 120_000; // 2 minutes for router mode
-const PROVIDER_NAME = "llama-cpp";
 
-let currentModels = [];
+const providers = new Map();
 const contextWindowCache = new WeakMap();
 const pendingFetches = new Set(); // avoid duplicate concurrent fetches
 
 export default async function (pi) {
   console.log("[dynamic-models] Extension loaded");
+  providers.clear();
+  pendingFetches.clear();
 
   const config = readModelsConfig();
   if (!config) {
@@ -33,25 +34,62 @@ export default async function (pi) {
     return;
   }
 
-  const providerConfig = config.providers?.[PROVIDER_NAME];
-  if (!providerConfig) {
-    console.log(`[dynamic-models] No "${PROVIDER_NAME}" provider in models.json — skipping`);
+  const dynamicProviders = Object.entries(config.providers ?? {}).filter(
+    ([, providerConfig]) => providerConfig?.modelDefinitionUrl
+  );
+
+  if (dynamicProviders.length === 0) {
+    console.log("[dynamic-models] No provider with modelDefinitionUrl in models.json — skipping");
     return;
   }
 
-  const modelDefinitionUrl = providerConfig.modelDefinitionUrl;
-  if (!modelDefinitionUrl) {
-    console.log("[dynamic-models] No modelDefinitionUrl in provider config — skipping");
+  await Promise.all(
+    dynamicProviders.map(([providerName, providerConfig]) =>
+      loadProvider(pi, providerName, providerConfig)
+    )
+  );
+
+  if (providers.size === 0) {
+    console.log("[dynamic-models] No dynamic providers registered — skipping context discovery");
     return;
   }
 
-  console.log(`[dynamic-models] modelDefinitionUrl = ${modelDefinitionUrl}`);
+  // ── Phase 2: Discover context windows on first provider request ──────
+  pi.on("before_provider_request", (event, ctx) => {
+    const modelId = event.payload?.model;
+    if (!modelId) return;
+
+    for (const [providerName, providerState] of matchingProviders(event, ctx, modelId)) {
+      const model = providerState.models.find((m) => m.id === modelId);
+      if (!model) continue;
+
+      const cached = contextWindowCache.get(model);
+      if (cached) continue; // Already discovered
+
+      // Avoid duplicate concurrent fetches for the same provider/model pair
+      const fetchKey = `${providerName}\0${modelId}`;
+      if (pendingFetches.has(fetchKey)) continue;
+      pendingFetches.add(fetchKey);
+
+      fetchContextWindow(providerName, model, modelId, pi).finally(() => {
+        pendingFetches.delete(fetchKey);
+      });
+    }
+  });
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+async function loadProvider(pi, providerName, providerConfig) {
+  const { modelDefinitionUrl } = providerConfig;
+
+  console.log(`[dynamic-models] ${providerName}: modelDefinitionUrl = ${modelDefinitionUrl}`);
 
   try {
     const response = await fetch(modelDefinitionUrl);
     if (!response.ok) {
       console.error(
-        `[dynamic-models] Failed to fetch models: ${response.status} ${response.statusText}`
+        `[dynamic-models] ${providerName}: Failed to fetch models: ${response.status} ${response.statusText}`
       );
       return;
     }
@@ -61,50 +99,65 @@ export default async function (pi) {
 
     if (models.length === 0) {
       console.warn(
-        "[dynamic-models] No valid models found — keeping static models.json"
+        `[dynamic-models] ${providerName}: No valid models found — keeping static models.json`
       );
       return;
     }
 
-    currentModels = models;
+    providers.set(providerName, { models });
 
-    pi.registerProvider(PROVIDER_NAME, {
-      baseUrl: providerConfig.baseUrl,
-      apiKey: providerConfig.apiKey,
-      api: providerConfig.api,
-      models,
-      compat: providerConfig.compat,
-    });
+    registerProvider(pi, providerName, providerConfig, models);
 
-    console.log(`[dynamic-models] Registered ${models.length} models from ${modelDefinitionUrl}`);
+    console.log(`[dynamic-models] ${providerName}: Registered ${models.length} models from ${modelDefinitionUrl}`);
   } catch (err) {
     console.error(
-      `[dynamic-models] Error loading models: ${err.message}`
+      `[dynamic-models] ${providerName}: Error loading models: ${err.message}`
     );
   }
+}
 
-  // ── Phase 2: Discover context windows on first provider request ──────
-  pi.on("before_provider_request", (event, _ctx) => {
-    const modelId = event.payload?.model;
-    if (!modelId) return;
+function registerProvider(pi, providerName, providerConfig, models) {
+  const providerOptions = { ...providerConfig };
+  delete providerOptions.modelDefinitionUrl;
+  delete providerOptions.models;
 
-    const model = currentModels.find((m) => m.id === modelId);
-    if (!model) return;
-
-    const cached = contextWindowCache.get(model);
-    if (cached) return; // Already discovered
-
-    // Avoid duplicate concurrent fetches for the same model
-    if (pendingFetches.has(modelId)) return;
-    pendingFetches.add(modelId);
-
-    fetchContextWindow(model, modelId, pi).finally(() => {
-      pendingFetches.delete(modelId);
-    });
+  pi.registerProvider(providerName, {
+    ...providerOptions,
+    models,
   });
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────
+function matchingProviders(event, ctx, modelId) {
+  const providerName = getProviderName(event, ctx);
+
+  if (providerName) {
+    const providerState = providers.get(providerName);
+    return providerState ? [[providerName, providerState]] : [];
+  }
+
+  return [...providers.entries()].filter(([, providerState]) =>
+    providerState.models.some((model) => model.id === modelId)
+  );
+}
+
+function getProviderName(event, ctx) {
+  const candidates = [
+    event.providerName,
+    event.provider?.name,
+    event.provider?.id,
+    event.provider,
+    event.payload?.providerName,
+    event.payload?.provider?.name,
+    event.payload?.provider?.id,
+    event.payload?.provider,
+    ctx?.providerName,
+    ctx?.provider?.name,
+    ctx?.provider?.id,
+    ctx?.provider,
+  ];
+
+  return candidates.find((candidate) => typeof candidate === "string");
+}
 
 function readModelsConfig() {
   try {
@@ -136,64 +189,63 @@ function formatModelName(id) {
   return quant ? `${base} (${quant})` : base;
 }
 
-async function fetchContextWindow(model, modelId, pi) {
+async function fetchContextWindow(providerName, model, modelId, pi) {
   const config = readModelsConfig();
-  const baseUrl = config?.providers?.[PROVIDER_NAME]?.baseUrl;
-  const encoded = encodeURIComponent(model.id);
-  const url = `${baseUrl.replace("/v1", "")}/props?model=${encoded}&autoload=`;
+  const providerConfig = config?.providers?.[providerName];
+  const baseUrl = providerConfig?.baseUrl;
+  if (!baseUrl) {
+    console.warn(`[dynamic-models] ${providerName}: No baseUrl configured for props fetch`);
+    return;
+  }
 
-  console.log(`[dynamic-models] Fetching props for ${modelId}...`);
+  const encoded = encodeURIComponent(model.id);
+  const url = `${baseUrl.replace(/\/v1\/?$/, "")}/props?model=${encoded}&autoload=`;
+
+  console.log(`[dynamic-models] ${providerName}: Fetching props for ${modelId}...`);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PROPS_TIMEOUT_MS);
 
   try {
-    var response = await fetch(`${url}false`, { signal: controller.signal });
+    let response = await fetch(`${url}false`, { signal: controller.signal });
 
     // 400/404 = model not loaded on server yet → leave default, try later
     if (response.status === 400 || response.status === 404) {
       console.log(
-        `[dynamic-models] Model ${modelId} not loaded yet (${response.status}) — try to load model`
+        `[dynamic-models] ${providerName}: Model ${modelId} not loaded yet (${response.status}) — try to load model`
       );
       response = await fetch(`${url}true`, { signal: controller.signal });
     }
 
     if (!response.ok) {
       console.warn(
-        `[dynamic-models] Props fetch failed for ${url}: ${response.status} ${response.statusText}`
+        `[dynamic-models] ${providerName}: Props fetch failed for ${url}: ${response.status} ${response.statusText}`
       );
       return;
     }
 
     const data = await response.json();
-    const nCtx =
-      data?.default_generation_settings?.n_ctx;
-      console.warn(`[dynamic-models] Given: ${nCtx}`);
+    const nCtx = data?.default_generation_settings?.n_ctx;
+    console.warn(`[dynamic-models] ${providerName}: Given: ${nCtx}`);
     if (typeof nCtx === "number" && nCtx > 0) {
       model.contextWindow = nCtx;
       contextWindowCache.set(model, nCtx);
 
       // Update provider registry so UI picks up the new value
-      pi.registerProvider(PROVIDER_NAME, {
-        baseUrl: config.providers[PROVIDER_NAME].baseUrl,
-        apiKey: config.providers[PROVIDER_NAME].apiKey,
-        api: config.providers[PROVIDER_NAME].api,
-        models: currentModels,
-        compat: config.providers[PROVIDER_NAME].compat,
-      });
+      registerProvider(pi, providerName, providerConfig, providers.get(providerName).models);
 
-      console.log(`[dynamic-models] Context window for ${modelId}: ${nCtx}`);
+      console.log(`[dynamic-models] ${providerName}: Context window for ${modelId}: ${nCtx}`);
     } else {
       console.warn(
-        `[dynamic-models] No n_ctx in props response for ${modelId}: ${JSON.stringify(data).slice(0, 200)}`
+        `[dynamic-models] ${providerName}: No n_ctx in props response for ${modelId}: ${JSON.stringify(data).slice(0, 200)}`
       );
     }
   } catch (err) {
     if (err.name === "AbortError") {
-      console.warn(`[dynamic-models] Props fetch timed out for ${modelId}`);
+      console.warn(`[dynamic-models] ${providerName}: Props fetch timed out for ${modelId}`);
     } else {
       console.warn(
-        `[dynamic-models] Failed to fetch props. ${err.message}`
+        `[dynamic-models] ${providerName}: Failed to fetch props. ${err.message}`
       );
     }
   } finally {

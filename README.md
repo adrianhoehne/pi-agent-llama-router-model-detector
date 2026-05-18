@@ -4,12 +4,12 @@ A model loader for the `llama.cpp` router mode, that automatically discovers and
 
 ## Overview
 
-This extension replaces the static `models` array in the `models.json` configuration with a dynamically fetched list of models it `modelDefinitionUrl` is set. 
+This extension replaces the static `models` array in each `models.json` provider block that has `modelDefinitionUrl` set with a dynamically fetched list of models.
 
 It works in two phases:
 
-1. **Startup** — Fetches a model definition JSON from a configurable URL (`modelDefinitionUrl`) and injects the discovered models into the provider registry.
-2. **First use** — On the first request for each model, it queries the llama.cpp server's `/props` endpoint to discover the actual context window (`n_ctx`) for that model, then updates the provider registry so the UI reflects the correct value. If the model is not loaded, it loads the model automatically.
+1. **Startup** — Finds every provider block with `modelDefinitionUrl`, fetches its model definition JSON, and registers the discovered models under that provider's configured name.
+2. **First use** — On the first request for each provider/model pair, it queries the matching llama.cpp server's `/props` endpoint to discover the actual context window (`n_ctx`), then updates that provider registry entry so the UI reflects the correct value. If the model is not loaded, it loads the model automatically.
 
 ## Configuration
 
@@ -27,7 +27,7 @@ Add the extension path to `settings.json` under the `extensions` array:
 
 ### 2. Configure the `models.json` config
 
-Add a `modelDefinitionUrl` field to the `llama-cpp` or whatever you named your provider in `models.json`:
+Add a `modelDefinitionUrl` field to any provider in `models.json`. The provider block name is used as the provider name. Multiple providers can be configured this way:
 
 ```json
 {
@@ -41,6 +41,12 @@ Add a `modelDefinitionUrl` field to the `llama-cpp` or whatever you named your p
         "supportsReasoningEffort": true
       },
       "modelDefinitionUrl": "http://127.0.0.1:28002/v1/models"
+    },
+    "llama-cpp-large": {
+      "baseUrl": "http://127.0.0.1:28003/v1",
+      "api": "openai-completions",
+      "apiKey": "no",
+      "modelDefinitionUrl": "http://127.0.0.1:28003/v1/models"
     }
   }
 }

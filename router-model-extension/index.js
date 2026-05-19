@@ -162,10 +162,21 @@ function getProviderName(event, ctx) {
 function readModelsConfig() {
   try {
     const raw = readFileSync(MODELS_PATH, "utf-8");
-    return JSON.parse(raw);
-  } catch {
+    return JSON.parse(stripJsonComments(raw));
+  } catch (err) {
+    console.warn(`[dynamic-models] Failed to read ${MODELS_PATH}: ${err.message}`);
     return null;
   }
+}
+
+function stripJsonComments(input) {
+  return input
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) =>
+      match[0] === "\"" ? match : ""
+    )
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail) =>
+      tail ?? (match[0] === "\"" ? match : "")
+    );
 }
 
 function transformModels(rawModels) {
